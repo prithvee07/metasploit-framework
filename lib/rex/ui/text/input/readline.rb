@@ -158,6 +158,14 @@ begin
         RbReadline.rl_instream = fd
         RbReadline.rl_outstream = output
 
+        # Ask the terminal to wrap pastes in \e[200~ ... \e[201~ markers so
+        # the bracketed-paste handling installed in
+        # Msf::Ui::Console::Driver#setup_rbreadline_bracketed_paste can
+        # insert a whole paste in one shot instead of one redisplay per
+        # character (see #20323). No-op on terminals that don't support it.
+        bracketed_paste = !Rex::Compat.is_windows && output.respond_to?(:write)
+        output.write("\e[?2004h") if bracketed_paste
+
         begin
           line = RbReadline.readline(reset_sequence + prompt)
         rescue ::Exception => exception
@@ -165,6 +173,8 @@ begin
           RbReadline.rl_deprep_terminal()
 
           raise exception
+        ensure
+          output.write("\e[?2004l") if bracketed_paste
         end
 
         if add_history && line && !line.start_with?(' ')
