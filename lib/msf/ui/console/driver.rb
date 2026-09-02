@@ -710,6 +710,10 @@ protected
   def setup_readline
     require 'readline'
 
+    if defined?(::RbReadline) && !Rex::Compat.is_windows
+      setup_rbreadline_bracketed_paste
+    end
+
     # Only Windows requires a monkey-patched RbReadline
     return unless Rex::Compat.is_windows
 
@@ -746,6 +750,89 @@ protected
         def self.insert_some_chars(*args)
           refresh_console_handle
           old_insert_some_chars(*args)
+        end
+      end
+    end
+  end
+
+  # rb-readline (the pure-Ruby readline fallback used when the native
+  # readline C extension isn't available -- e.g. some Linux distro
+  # packages) redraws the entire line on every single character
+  # inserted. A terminal paste that isn't wrapped in bracketed-paste
+  # markers is delivered to readline one byte at a time, so pasting N
+  # characters costs a full O(line length) redisplay N times, i.e.
+  # O(N^2) overall. See #20323.
+  #
+  # This teaches RbReadline's low-level byte reader to recognize the
+  # terminal's bracketed-paste markers (\e[200~ ... \e[201~, enabled by
+  # writing \e[?2004h -- see Rex::Ui::Text::Input::Readline) and, when
+  # it sees them, read the whole pasted blob and insert it in one shot
+  # via rl_insert_text followed by a single redisplay, instead of
+  # letting each pasted byte trigger its own redisplay. Any byte
+  # sequence that isn't an exact bracketed-paste marker (arrow keys,
+  # Home/End, a lone Escape, etc.) is pushed back onto the stream
+  # unmodified and falls through to the original, unmodified read path.
+  def setup_rbreadline_bracketed_paste
+    return if defined?(RbReadline.msf_bracketed_paste_installed?)
+
+    ::RbReadline.instance_eval do
+      class << self
+        alias_method :msf_original_rl_getc, :rl_getc
+
+        def msf_bracketed_paste_installed?
+          true
+        end
+
+        def rl_getc(stream)
+          c = msf_original_rl_getc(stream)
+          return c unless c == "\e" && stream.respond_to?(:ungetbyte)
+
+          paste = msf_read_bracketed_paste(stream)
+          return c if paste.nil?
+
+          rl_insert_text(paste)
+          send(@rl_redisplay_function)
+          @_rl_want_redisplay = false
+
+          # Read whatever key follows the pasted text (often Enter, or
+          # nothing yet if the paste didn't end in a newline).
+          rl_getc(stream)
+        end
+
+        # If +stream+ is sitting right at a bracketed-paste start marker
+        # (the leading Escape has already been consumed into +c+ by the
+        # caller), consume through the end marker and return the pasted
+        # text with the markers stripped. Otherwise, push every byte
+        # this method looked at back onto +stream+ and return nil so the
+        # caller's normal byte-at-a-time handling takes over unchanged.
+        def msf_read_bracketed_paste(stream)
+          start_marker = '[200~'
+          end_marker = "\e[201~"
+
+          seen = +''
+          start_marker.each_char do |expected|
+            byte = stream.read(1)
+            break if byte.nil?
+
+            seen << byte
+            break unless byte == expected
+          end
+
+          unless seen == start_marker
+            seen.each_byte.to_a.reverse_each { |b| stream.ungetbyte(b) }
+            return nil
+          end
+
+          content = +''
+          loop do
+            byte = stream.read(1)
+            break if byte.nil?
+
+            content << byte
+            break if content.end_with?(end_marker)
+          end
+
+          content.delete_suffix(end_marker)
         end
       end
     end
